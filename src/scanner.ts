@@ -2,6 +2,7 @@ import { Decimal } from "decimal.js";
 import type {
   Basket,
   Classification,
+  FeeSchedule,
   Market,
   OrderBook,
   ScanResult,
@@ -11,7 +12,7 @@ import { estimateFill } from "./depth.js";
 import type { Config } from "./config.js";
 
 export type BookProvider = (tokenId: string) => Promise<OrderBook>;
-export type FeeProvider = (tokenId: string) => Promise<string>;
+export type FeeProvider = (market: Market) => Promise<FeeSchedule>;
 
 function timestampState(
   value: string,
@@ -22,10 +23,18 @@ function timestampState(
   if (!Number.isFinite(parsed) || parsed > now) return "invalid";
   return now - parsed > maxAgeSeconds * 1000 ? "stale" : "valid";
 }
-function validFeeBps(value: string): boolean {
+function validFeeSchedule(value: FeeSchedule): boolean {
   try {
-    const parsed = new Decimal(value);
-    return parsed.isInteger() && parsed.gte(0) && parsed.lte(10_000);
+    const rate = new Decimal(value.rate);
+    return (
+      rate.isFinite() &&
+      rate.gte(0) &&
+      rate.lte(1) &&
+      Number.isInteger(value.exponent) &&
+      value.exponent >= 1 &&
+      value.exponent <= 100 &&
+      typeof value.takerOnly === "boolean"
+    );
   } catch {
     return false;
   }
@@ -43,7 +52,7 @@ export async function scanRelations(
   const accepted: ScanResult["accepted"] = [];
   const rejected: ScanResult["rejected"] = [];
   const bookCache = new Map<string, Promise<OrderBook>>();
-  const feeCache = new Map<string, Promise<string>>();
+  const feeCache = new Map<string, Promise<FeeSchedule>>();
   const book = (id: string): Promise<OrderBook> => {
     let pending = bookCache.get(id);
     if (!pending) {
@@ -52,11 +61,13 @@ export async function scanRelations(
     }
     return pending;
   };
-  const fee = (id: string): Promise<string> => {
-    let pending = feeCache.get(id);
+  const fee = (market: Market): Promise<FeeSchedule> => {
+    if (!market.feesEnabled)
+      return Promise.resolve({ rate: "0", exponent: 1, takerOnly: true });
+    let pending = feeCache.get(market.conditionId);
     if (!pending) {
-      pending = getFeeRate(id);
-      feeCache.set(id, pending);
+      pending = getFeeRate(market);
+      feeCache.set(market.conditionId, pending);
     }
     return pending;
   };
@@ -127,13 +138,12 @@ export async function scanRelations(
         failure = "stale_book";
         continue;
       }
-      let fees: [string, string];
+      let fees: [FeeSchedule, FeeSchedule];
       try {
-        fees = await Promise.all([
-          fee(basket.legs[0].tokenId),
-          fee(basket.legs[1].tokenId),
-        ]);
-        if (!fees.every(validFeeBps)) throw new Error("invalid fee");
+        const feeMarkets = basket.legs.map((leg) => byId.get(leg.marketId));
+        if (!feeMarkets[0] || !feeMarkets[1]) throw new Error("market missing");
+        fees = await Promise.all([fee(feeMarkets[0]), fee(feeMarkets[1])]);
+        if (!fees.every(validFeeSchedule)) throw new Error("invalid fee");
       } catch {
         failure = "fee_unavailable";
         continue;

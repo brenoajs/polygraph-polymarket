@@ -1,8 +1,14 @@
 import { Decimal } from "decimal.js";
-import type { Basket, FillEstimate, OrderBook } from "./types.js";
+import type { Basket, FeeSchedule, FillEstimate, OrderBook } from "./types.js";
 
 Decimal.set({ precision: 40, rounding: Decimal.ROUND_DOWN });
 const ZERO = new Decimal(0);
+const ONE = new Decimal(1);
+const ZERO_FEE: FeeSchedule = {
+  rate: "0",
+  exponent: 1,
+  takerOnly: true,
+};
 
 function available(book: OrderBook): Decimal {
   return book.asks.reduce((sum, level) => sum.plus(level.size), ZERO);
@@ -14,18 +20,20 @@ interface LegEstimate {
 function estimateLeg(
   book: OrderBook,
   quantity: Decimal,
-  baseFeeBps: string,
+  schedule: FeeSchedule,
 ): LegEstimate | null {
   let remaining = quantity;
   let cost = ZERO;
   let fee = ZERO;
-  const rate = new Decimal(baseFeeBps).div(10_000);
+  const rate = new Decimal(schedule.rate);
   for (const level of book.asks) {
     const price = new Decimal(level.price);
     const take = Decimal.min(remaining, level.size);
     cost = cost.plus(take.mul(price));
-    // Polymarket taker fee: shares * rate * price * (1 - price).
-    fee = fee.plus(take.mul(rate).mul(price).mul(ONE.minus(price)));
+    // Effective CLOB formula: shares * rate * (price * (1 - price))^exponent.
+    fee = fee.plus(
+      take.mul(rate).mul(price.mul(ONE.minus(price)).pow(schedule.exponent)),
+    );
     remaining = remaining.minus(take);
     if (remaining.lte(0)) return { cost, fee };
   }
@@ -34,16 +42,15 @@ function estimateLeg(
 function d(value: Decimal): string {
   return value.toDecimalPlaces(8).toFixed();
 }
-const ONE = new Decimal(1);
 
 function totalFor(
   books: [OrderBook, OrderBook],
   quantity: Decimal,
-  baseFeeBps: [string, string],
+  schedules: [FeeSchedule, FeeSchedule],
   extraRate: Decimal,
 ): Decimal | null {
-  const leg0 = estimateLeg(books[0], quantity, baseFeeBps[0]);
-  const leg1 = estimateLeg(books[1], quantity, baseFeeBps[1]);
+  const leg0 = estimateLeg(books[0], quantity, schedules[0]);
+  const leg1 = estimateLeg(books[1], quantity, schedules[1]);
   if (!leg0 || !leg1) return null;
   const gross = leg0.cost.plus(leg1.cost);
   return gross.plus(leg0.fee).plus(leg1.fee).plus(gross.mul(extraRate));
@@ -53,7 +60,7 @@ export function estimateFill(
   basket: Basket,
   books: [OrderBook, OrderBook],
   cap: string,
-  baseFeeBps: [string, string],
+  schedules: [FeeSchedule, FeeSchedule],
   extraConservativeFeeBps: string,
 ): FillEstimate | null {
   if (books.some((book) => book.asks.length === 0)) return null;
@@ -65,8 +72,8 @@ export function estimateFill(
   let high = maxDepth;
   for (let i = 0; i < 64; i++) {
     const mid = low.plus(high).div(2);
-    const leg0 = estimateLeg(books[0], mid, baseFeeBps[0]);
-    const leg1 = estimateLeg(books[1], mid, baseFeeBps[1]);
+    const leg0 = estimateLeg(books[0], mid, schedules[0]);
+    const leg1 = estimateLeg(books[1], mid, schedules[1]);
     if (leg0 !== null && leg1 !== null) {
       const gross = leg0.cost.plus(leg1.cost);
       const total = gross
@@ -81,7 +88,7 @@ export function estimateFill(
     high = mid;
   }
   const roundedUp = low.toDecimalPlaces(6, Decimal.ROUND_UP);
-  const roundedUpTotal = totalFor(books, roundedUp, baseFeeBps, extraRate);
+  const roundedUpTotal = totalFor(books, roundedUp, schedules, extraRate);
   const quantity =
     roundedUpTotal?.lte(capD) === true
       ? roundedUp
@@ -91,8 +98,8 @@ export function estimateFill(
     books.some((book) => quantity.lt(new Decimal(book.minOrderSize)))
   )
     return null;
-  const leg0 = estimateLeg(books[0], quantity, baseFeeBps[0]);
-  const leg1 = estimateLeg(books[1], quantity, baseFeeBps[1]);
+  const leg0 = estimateLeg(books[0], quantity, schedules[0]);
+  const leg1 = estimateLeg(books[1], quantity, schedules[1]);
   if (leg0 === null || leg1 === null) return null;
   const gross = leg0.cost.plus(leg1.cost);
   const fee = leg0.fee.plus(leg1.fee).plus(gross.mul(extraRate));
@@ -128,7 +135,7 @@ export function estimateFill(
 }
 
 export function bidValue(book: OrderBook, quantity: string): string | null {
-  return bidMark(book, quantity, "0")?.grossValue ?? null;
+  return bidMark(book, quantity, ZERO_FEE)?.grossValue ?? null;
 }
 
 export interface BidMark {
@@ -137,21 +144,23 @@ export interface BidMark {
   netValue: string;
 }
 
-/** Walk executable bids and deduct the current token-specific taker fee. */
+/** Walk executable bids and deduct the effective condition-level taker fee. */
 export function bidMark(
   book: OrderBook,
   quantity: string,
-  baseFeeBps: string,
+  schedule: FeeSchedule,
 ): BidMark | null {
   let remaining = new Decimal(quantity);
   let value = ZERO;
   let fee = ZERO;
-  const rate = new Decimal(baseFeeBps).div(10_000);
+  const rate = new Decimal(schedule.rate);
   for (const level of book.bids) {
     const price = new Decimal(level.price);
     const take = Decimal.min(remaining, level.size);
     value = value.plus(take.mul(price));
-    fee = fee.plus(take.mul(rate).mul(price).mul(ONE.minus(price)));
+    fee = fee.plus(
+      take.mul(rate).mul(price.mul(ONE.minus(price)).pow(schedule.exponent)),
+    );
     remaining = remaining.minus(take);
     if (remaining.lte(0))
       return {

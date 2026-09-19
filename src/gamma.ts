@@ -32,10 +32,19 @@ export function parseGammaMarket(
   )
     return null;
   const id = stringValue(raw.id);
+  const conditionId = stringValue(raw.conditionId).trim();
   const question = stringValue(raw.question).trim();
   const yesTokenId = tokens[yesIndex];
   const noTokenId = tokens[noIndex];
-  if (!id || !question || !yesTokenId || !noTokenId) return null;
+  if (
+    !id ||
+    !conditionId ||
+    typeof raw.feesEnabled !== "boolean" ||
+    !question ||
+    !yesTokenId ||
+    !noTokenId
+  )
+    return null;
   const events: unknown[] = Array.isArray(raw.events) ? raw.events : [];
   const firstEvent = events[0];
   const eventId =
@@ -45,6 +54,8 @@ export function parseGammaMarket(
   return {
     id,
     eventId,
+    conditionId,
+    feesEnabled: raw.feesEnabled,
     question,
     description: stringValue(raw.description),
     rules: stringValue(raw.rules),

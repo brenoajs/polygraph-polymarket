@@ -6,6 +6,8 @@ export function demoMarkets(): [Market, Market] {
     {
       id: "fixture-a",
       eventId: "fixture-event",
+      conditionId: "fixture-condition-a",
+      feesEnabled: false,
       question: "Will Example City exceed 30 C on July 1?",
       description: "Offline fixture A",
       rules: "Resolves YES iff official temperature exceeds 30 C.",
@@ -21,6 +23,8 @@ export function demoMarkets(): [Market, Market] {
     {
       id: "fixture-b",
       eventId: "fixture-event",
+      conditionId: "fixture-condition-b",
+      feesEnabled: false,
       question: "Will Example City be at most 30 C on July 1?",
       description: "Offline fixture B",
       rules: "Resolves YES iff official temperature is at most 30 C.",

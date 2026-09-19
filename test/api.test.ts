@@ -1,12 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { parseGammaMarket } from "../src/gamma.js";
-import { parseFeeRate, parseOrderBook } from "../src/clob.js";
+import { parseFeeSchedule, parseOrderBook } from "../src/clob.js";
 
 describe("public API normalization", () => {
   it("maps Yes/No tokens and preserves all resolution context", () => {
     const market = parseGammaMarket(
       {
         id: "7",
+        conditionId: "0xcondition",
+        feesEnabled: true,
         question: "Q?",
         outcomes: '["No","Yes"]',
         clobTokenIds: '["no-token","yes-token"]',
@@ -25,6 +27,8 @@ describe("public API normalization", () => {
     expect(market).toMatchObject({
       id: "7",
       eventId: "e",
+      conditionId: "0xcondition",
+      feesEnabled: true,
       yesTokenId: "yes-token",
       noTokenId: "no-token",
       liquidity: "12.5",
@@ -67,7 +71,7 @@ describe("public API normalization", () => {
           { price: "0.3", size: "4" },
         ],
       },
-      "x",
+      "t",
     );
     expect(b.asks.map((x) => x.price)).toEqual(["0.4", "0.7"]);
     expect(b.bids.map((x) => x.price)).toEqual(["0.3", "0.2"]);
@@ -92,8 +96,36 @@ describe("public API normalization", () => {
       ),
     ).toThrow(/min_order_size/i);
   });
-  it("parses base fee bps and rejects malformed fee responses", () => {
-    expect(parseFeeRate({ base_fee: 200 })).toBe("200");
-    expect(() => parseFeeRate({ base_fee: "oops" })).toThrow(/base_fee/i);
+  it.each([undefined, "", "other-token"])(
+    "requires the exact requested CLOB asset identity: %s",
+    (asset_id) => {
+      expect(() =>
+        parseOrderBook(
+          {
+            asset_id,
+            timestamp: Date.now(),
+            min_order_size: "1",
+            asks: [],
+            bids: [],
+          },
+          "t",
+        ),
+      ).toThrow(/asset_id/i);
+    },
+  );
+  it("uses fd as the effective schedule and ignores legacy base_fee", () => {
+    expect(
+      parseFeeSchedule({ base_fee: 1000, fd: { r: 0.04, e: 1, to: true } }),
+    ).toEqual({ rate: "0.04", exponent: 1, takerOnly: true });
+  });
+  it.each([
+    {},
+    { fd: null },
+    { fd: { r: "0.04", e: 1, to: true } },
+    { fd: { r: 0.04, e: 0, to: true } },
+    { fd: { r: 0.04, e: 1.5, to: true } },
+    { fd: { r: 0.04, e: 1, to: "true" } },
+  ])("rejects a missing or malformed effective fee schedule", (payload) => {
+    expect(() => parseFeeSchedule(payload)).toThrow(/fee schedule/i);
   });
 });

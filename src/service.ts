@@ -42,7 +42,7 @@ export async function scanStored(store: Store, config: Config) {
     store.listMarkets(),
     store.listClassifications(),
     (id) => clob.getBook(id),
-    (id) => clob.getFeeRate(id),
+    (market) => clob.getFeeSchedule(market.conditionId),
     config,
     cash,
   );

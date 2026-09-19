@@ -14,6 +14,8 @@ export type Outcome = "YES" | "NO";
 export interface Market {
   id: string;
   eventId: string | null;
+  conditionId: string;
+  feesEnabled: boolean;
   question: string;
   description: string;
   rules: string;
@@ -25,6 +27,13 @@ export interface Market {
   volume: string;
   active: boolean;
   fetchedAt: string;
+}
+
+export interface FeeSchedule {
+  /** Decimal rate, e.g. 0.04 means four percent in the fee formula. */
+  rate: string;
+  exponent: number;
+  takerOnly: boolean;
 }
 
 export interface CandidatePair {

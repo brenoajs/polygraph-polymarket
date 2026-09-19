@@ -1,5 +1,5 @@
 import { Decimal } from "decimal.js";
-import type { Level, OrderBook } from "./types.js";
+import type { FeeSchedule, Level, OrderBook } from "./types.js";
 import { asRecord, fetchJson, stringValue } from "./http.js";
 
 function levels(value: unknown, side: "asks" | "bids"): Level[] {
@@ -57,17 +57,32 @@ function parseMinOrderSize(value: unknown): string {
   throw new Error("Invalid CLOB min_order_size");
 }
 
-export function parseFeeRate(input: unknown): string {
-  const raw = asRecord(input, "CLOB fee rate");
-  const value = raw.base_fee;
+export const ZERO_FEE_SCHEDULE: Readonly<FeeSchedule> = Object.freeze({
+  rate: "0",
+  exponent: 1,
+  takerOnly: true,
+});
+
+export function parseFeeSchedule(input: unknown): FeeSchedule {
+  const market = asRecord(input, "CLOB market");
+  const raw = asRecord(market.fd, "CLOB fee schedule");
   if (
-    typeof value !== "number" ||
-    !Number.isInteger(value) ||
-    value < 0 ||
-    value > 10_000
+    typeof raw.r !== "number" ||
+    !Number.isFinite(raw.r) ||
+    raw.r < 0 ||
+    raw.r > 1 ||
+    typeof raw.e !== "number" ||
+    !Number.isInteger(raw.e) ||
+    raw.e < 1 ||
+    raw.e > 100 ||
+    typeof raw.to !== "boolean"
   )
-    throw new Error("Invalid CLOB base_fee; expected integer basis points");
-  return String(value);
+    throw new Error("Invalid CLOB fee schedule fd:{r,e,to}");
+  return {
+    rate: new Decimal(raw.r).toFixed(),
+    exponent: raw.e,
+    takerOnly: raw.to,
+  };
 }
 
 export function parseOrderBook(
@@ -76,8 +91,18 @@ export function parseOrderBook(
   nowMs = Date.now(),
 ): OrderBook {
   const raw = asRecord(input, "CLOB book");
+  if (
+    typeof tokenId !== "string" ||
+    tokenId.length === 0 ||
+    typeof raw.asset_id !== "string" ||
+    raw.asset_id.length === 0 ||
+    raw.asset_id !== tokenId
+  )
+    throw new Error(
+      "Invalid CLOB asset_id: must exactly match requested token",
+    );
   return {
-    tokenId: stringValue(raw.asset_id, tokenId),
+    tokenId: raw.asset_id,
     timestamp: parseTimestamp(raw.timestamp, nowMs),
     minOrderSize: parseMinOrderSize(raw.min_order_size),
     asks: levels(raw.asks, "asks"),
@@ -95,9 +120,12 @@ export class ClobClient {
     url.searchParams.set("token_id", tokenId);
     return parseOrderBook(await fetchJson(url, this.timeoutMs), tokenId);
   }
-  async getFeeRate(tokenId: string): Promise<string> {
-    const url = new URL("/fee-rate", this.baseUrl);
-    url.searchParams.set("token_id", tokenId);
-    return parseFeeRate(await fetchJson(url, this.timeoutMs));
+  async getFeeSchedule(conditionId: string): Promise<FeeSchedule> {
+    if (!conditionId) throw new Error("Missing CLOB condition ID");
+    const url = new URL(
+      `/clob-markets/${encodeURIComponent(conditionId)}`,
+      this.baseUrl,
+    );
+    return parseFeeSchedule(await fetchJson(url, this.timeoutMs));
   }
 }

@@ -8,6 +8,11 @@ const [a, b] = demoMarkets();
 const basket = basketsFor("exhaustive", a, b)[0];
 if (!basket) throw new Error("expected an exhaustive fixture basket");
 const now = new Date().toISOString();
+const fee = (rate: string, exponent = 1) => ({
+  rate,
+  exponent,
+  takerOnly: true,
+});
 function book(
   tokenId: string,
   asks: OrderBook["asks"],
@@ -27,7 +32,7 @@ describe("depth-aware decimal fills", () => {
         book(b.yesTokenId, [{ price: "0.40", size: "20" }]),
       ],
       "12.6975",
-      ["100", "100"],
+      [fee("0.01"), fee("0.01")],
       "100",
     );
     expect(fill).not.toBeNull();
@@ -44,7 +49,7 @@ describe("depth-aware decimal fills", () => {
         basket,
         [book("a", []), book("b", [{ price: "0.2", size: "1" }])],
         "1",
-        ["0", "0"],
+        [fee("0"), fee("0")],
         "0",
       ),
     ).toBeNull());
@@ -64,7 +69,7 @@ describe("depth-aware decimal fills", () => {
     ).toBe("1.4"));
   it("marks executable bids net of the live fee formula", () => {
     expect(
-      bidMark(book("x", [], [{ price: "0.5", size: "2" }]), "2", "100"),
+      bidMark(book("x", [], [{ price: "0.5", size: "2" }]), "2", fee("0.01")),
     ).toEqual({ grossValue: "1", exitFee: "0.005", netValue: "0.995" });
   });
   it("charges the live fee formula at every consumed ask level", () => {
@@ -78,11 +83,24 @@ describe("depth-aware decimal fills", () => {
         book("b", [{ price: "0.3", size: "2" }]),
       ],
       "10",
-      ["200", "100"],
+      [fee("0.02"), fee("0.01")],
       "0",
     );
     expect(fill?.quantity).toBe("2");
     expect(fill?.fee).toBe("0.0106");
+  });
+  it("supports a validated fee exponent at every level", () => {
+    const fill = estimateFill(
+      basket,
+      [
+        book("a", [{ price: "0.2", size: "1" }]),
+        book("b", [{ price: "0.5", size: "1" }]),
+      ],
+      "10",
+      [fee("0.04", 2), fee("0")],
+      "0",
+    );
+    expect(fill?.fee).toBe("0.001024");
   });
   it("rejects quantities below either CLOB minimum order", () => {
     const left = book("a", [{ price: "0.4", size: "4" }]);
@@ -92,7 +110,7 @@ describe("depth-aware decimal fills", () => {
         basket,
         [left, book("b", [{ price: "0.4", size: "4" }])],
         "10",
-        ["0", "0"],
+        [fee("0"), fee("0")],
         "0",
       ),
     ).toBeNull();

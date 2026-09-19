@@ -14,7 +14,8 @@ function fixtureBookProvider(books: ReturnType<typeof demoBooks>) {
     return Promise.resolve(fixtureBook);
   };
 }
-const noFees = () => Promise.resolve("0");
+const noFees = () =>
+  Promise.resolve({ rate: "0", exponent: 1, takerOnly: true });
 
 describe("scanner safety gates", () => {
   it("accepts a fresh high-confidence depth-backed edge", async () => {
@@ -110,22 +111,62 @@ describe("scanner safety gates", () => {
   });
   it("rejects an apparent edge after live fees", async () => {
     const result = await scanRelations(
-      demoMarkets(),
+      demoMarkets().map((market) => ({ ...market, feesEnabled: true })),
       [demoClassification()],
       fixtureBookProvider(demoBooks()),
-      () => Promise.resolve("10000"),
+      () => Promise.resolve({ rate: "1", exponent: 1, takerOnly: true }),
       loadConfig({ tradeCap: "10" }),
     );
     expect(result.rejected[0]?.reason).toBe("non_positive_or_small_edge");
   });
   it("fails closed when a fee cannot be retrieved", async () => {
     const result = await scanRelations(
-      demoMarkets(),
+      demoMarkets().map((market) => ({ ...market, feesEnabled: true })),
       [demoClassification()],
       fixtureBookProvider(demoBooks()),
       () => Promise.reject(new Error("fee API unavailable")),
       loadConfig(),
     );
     expect(result.rejected[0]?.reason).toBe("fee_unavailable");
+  });
+  it("fails closed on a malformed fee schedule", async () => {
+    const result = await scanRelations(
+      demoMarkets().map((market) => ({ ...market, feesEnabled: true })),
+      [demoClassification()],
+      fixtureBookProvider(demoBooks()),
+      () => Promise.resolve({ rate: "NaN", exponent: 1, takerOnly: true }),
+      loadConfig(),
+    );
+    expect(result.rejected[0]?.reason).toBe("fee_unavailable");
+  });
+  it("uses explicit zero schedules for fee-free markets without a lookup", async () => {
+    let calls = 0;
+    const result = await scanRelations(
+      demoMarkets(),
+      [demoClassification()],
+      fixtureBookProvider(demoBooks()),
+      () => {
+        calls += 1;
+        return Promise.reject(new Error("must not be called"));
+      },
+      loadConfig({ tradeCap: "10" }),
+    );
+    expect(result.accepted).toHaveLength(1);
+    expect(calls).toBe(0);
+  });
+  it("resolves fee schedules by market condition, not token", async () => {
+    const seen: string[] = [];
+    const result = await scanRelations(
+      demoMarkets().map((market) => ({ ...market, feesEnabled: true })),
+      [demoClassification()],
+      fixtureBookProvider(demoBooks()),
+      (market) => {
+        seen.push(market.conditionId);
+        return Promise.resolve({ rate: "0.04", exponent: 1, takerOnly: true });
+      },
+      loadConfig({ tradeCap: "10" }),
+    );
+    expect(result.accepted).toHaveLength(1);
+    expect(seen.sort()).toEqual(["fixture-condition-a", "fixture-condition-b"]);
   });
 });

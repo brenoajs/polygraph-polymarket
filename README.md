@@ -41,7 +41,7 @@ polygraph doctor                  # config/runtime and public API smoke check
 
 ## Safety model
 
-Jev (`experimental_evaluate`, model `typesafe-ai/jev`) only proposes one typed semantic relation and ambiguity metadata. Deterministic Decimal.js code maps relations to guaranteed-payoff baskets, consumes displayed asks at depth, retrieves each token's live CLOB fee rate, applies Polymarket's `shares × feeRate × price × (1-price)` formula at every consumed level, and gates stale books/classifications, confidence, ambiguity, minimum order size, slippage, depth, duplicate positions, cash, and net edge. `overlapping` and `unrelated` are never actionable.
+Jev (`experimental_evaluate`, model `typesafe-ai/jev`) only proposes one typed semantic relation and ambiguity metadata. Deterministic Decimal.js code maps relations to guaranteed-payoff baskets, consumes displayed asks at depth, retrieves each fee-bearing market's effective condition-level CLOB schedule (`fd`), applies `shares × rate × (price × (1-price))^exponent` at every consumed level, and gates stale books/classifications, confidence, ambiguity, minimum order size, slippage, depth, duplicate economic positions, cash, and net edge. `overlapping` and `unrelated` are never actionable.
 
 Relations map to baskets as follows:
 

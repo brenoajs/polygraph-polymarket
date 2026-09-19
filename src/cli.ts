@@ -13,7 +13,7 @@ import {
   scanStored,
   syncMarkets,
 } from "./service.js";
-import { ClobClient } from "./clob.js";
+import { ClobClient, ZERO_FEE_SCHEDULE } from "./clob.js";
 import { bidMark } from "./depth.js";
 import { GammaClient } from "./gamma.js";
 
@@ -50,7 +50,7 @@ program
           if (!book) throw new Error(`missing fixture book ${id}`);
           return Promise.resolve(book);
         },
-        () => Promise.resolve("0"),
+        () => Promise.resolve(ZERO_FEE_SCHEDULE),
         config,
         config.startingCash,
       );
@@ -171,8 +171,10 @@ program
               markStatus = "stale";
               break;
             }
-            const feeRate = await clob.getFeeRate(leg.tokenId);
-            const legMark = bidMark(book, leg.quantity, feeRate);
+            const feeSchedule = leg.feesEnabled
+              ? await clob.getFeeSchedule(leg.conditionId)
+              : ZERO_FEE_SCHEDULE;
+            const legMark = bidMark(book, leg.quantity, feeSchedule);
             if (legMark === null) {
               markStatus = "unavailable";
               break;
@@ -218,8 +220,10 @@ program
       if (markets[0]) {
         const client = new ClobClient(config.clobUrl, config.httpTimeoutMs);
         const book = await client.getBook(markets[0].yesTokenId);
-        const feeRate = await client.getFeeRate(markets[0].yesTokenId);
-        clob = `ok (${book.asks.length} asks, ${book.bids.length} bids, base fee ${feeRate} bps)`;
+        const feeSchedule = markets[0].feesEnabled
+          ? await client.getFeeSchedule(markets[0].conditionId)
+          : ZERO_FEE_SCHEDULE;
+        clob = `ok (${book.asks.length} asks, ${book.bids.length} bids, effective fee rate ${feeSchedule.rate}, exponent ${feeSchedule.exponent})`;
       }
       output({
         node: process.version,

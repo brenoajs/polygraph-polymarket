@@ -4,9 +4,9 @@ import { DatabaseSync } from "node:sqlite";
 import { Decimal } from "decimal.js";
 import type {
   Classification,
+  BasketLeg,
   FillEstimate,
   Market,
-  Relation,
 } from "./types.js";
 
 function text(value: unknown, column: string): string {
@@ -33,22 +33,17 @@ export interface PositionRow {
   opened_at: string;
 }
 
-function relationForSortedPair(c: Classification): Relation {
-  if (c.marketAId <= c.marketBId) return c.relation;
-  if (c.relation === "a_implies_b") return "b_implies_a";
-  if (c.relation === "b_implies_a") return "a_implies_b";
-  return c.relation;
-}
-
 export function canonicalPositionFingerprint(
-  c: Classification,
-  fill: FillEstimate,
+  legs: Pick<BasketLeg, "tokenId" | "outcome">[],
 ): string {
-  const markets = [c.marketAId, c.marketBId].sort();
-  const legs = fill.legs
-    .map((leg) => [leg.marketId, leg.tokenId, leg.outcome])
-    .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
-  return JSON.stringify([markets, relationForSortedPair(c), legs]);
+  const economicLegs = legs
+    .map((leg) => [leg.tokenId, leg.outcome])
+    .sort((a, b) => {
+      const left = JSON.stringify(a);
+      const right = JSON.stringify(b);
+      return left < right ? -1 : left > right ? 1 : 0;
+    });
+  return JSON.stringify(economicLegs);
 }
 
 export class Store {
@@ -62,30 +57,113 @@ export class Store {
   }
   private migrate(): void {
     this.db.exec(`
-    CREATE TABLE IF NOT EXISTS markets (id TEXT PRIMARY KEY, event_id TEXT, question TEXT NOT NULL, description TEXT NOT NULL, rules TEXT NOT NULL, resolution_source TEXT NOT NULL DEFAULT '', yes_token_id TEXT NOT NULL, no_token_id TEXT NOT NULL, end_date TEXT, liquidity TEXT NOT NULL, volume TEXT NOT NULL, active INTEGER NOT NULL, fetched_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS markets (id TEXT PRIMARY KEY, event_id TEXT, condition_id TEXT NOT NULL, fees_enabled INTEGER NOT NULL, question TEXT NOT NULL, description TEXT NOT NULL, rules TEXT NOT NULL, resolution_source TEXT NOT NULL DEFAULT '', yes_token_id TEXT NOT NULL, no_token_id TEXT NOT NULL, end_date TEXT, liquidity TEXT NOT NULL, volume TEXT NOT NULL, active INTEGER NOT NULL, fetched_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS classifications (id INTEGER PRIMARY KEY, market_a_id TEXT NOT NULL, market_b_id TEXT NOT NULL, relation TEXT NOT NULL, ambiguous INTEGER NOT NULL, confidence REAL NOT NULL, rationale TEXT NOT NULL, source TEXT NOT NULL, model TEXT NOT NULL, classified_at TEXT NOT NULL, human_review_required INTEGER NOT NULL, UNIQUE(market_a_id, market_b_id));
     CREATE TABLE IF NOT EXISTS positions (id INTEGER PRIMARY KEY, fingerprint TEXT NOT NULL UNIQUE, market_a_id TEXT NOT NULL, market_b_id TEXT NOT NULL, relation TEXT NOT NULL, basket_key TEXT NOT NULL, quantity TEXT NOT NULL, gross_cost TEXT NOT NULL, fee TEXT NOT NULL, guaranteed_payout TEXT NOT NULL, opened_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open');
     CREATE TABLE IF NOT EXISTS fills (id INTEGER PRIMARY KEY, position_id INTEGER NOT NULL REFERENCES positions(id), filled_at TEXT NOT NULL, gross_cost TEXT NOT NULL, fee TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS legs (id INTEGER PRIMARY KEY, position_id INTEGER NOT NULL REFERENCES positions(id), market_id TEXT NOT NULL, token_id TEXT NOT NULL, outcome TEXT NOT NULL, quantity TEXT NOT NULL, average_price TEXT NOT NULL, cost TEXT NOT NULL);
-    CREATE TRIGGER IF NOT EXISTS fills_immutable_update BEFORE UPDATE ON fills BEGIN SELECT RAISE(ABORT, 'fills are immutable'); END;
-    CREATE TRIGGER IF NOT EXISTS fills_immutable_delete BEFORE DELETE ON fills BEGIN SELECT RAISE(ABORT, 'fills are immutable'); END;
-    CREATE TRIGGER IF NOT EXISTS legs_immutable_update BEFORE UPDATE ON legs BEGIN SELECT RAISE(ABORT, 'legs are immutable'); END;
-    CREATE TRIGGER IF NOT EXISTS legs_immutable_delete BEFORE DELETE ON legs BEGIN SELECT RAISE(ABORT, 'legs are immutable'); END;
   `);
-    const columns = this.db
-      .prepare("PRAGMA table_info(markets)")
-      .all() as Record<string, unknown>[];
-    if (!columns.some((column) => column.name === "resolution_source"))
-      this.db.exec(
-        "ALTER TABLE markets ADD COLUMN resolution_source TEXT NOT NULL DEFAULT ''",
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const columns = this.db
+        .prepare("PRAGMA table_info(markets)")
+        .all() as Record<string, unknown>[];
+      if (!columns.some((column) => column.name === "resolution_source"))
+        this.db.exec(
+          "ALTER TABLE markets ADD COLUMN resolution_source TEXT NOT NULL DEFAULT ''",
+        );
+      if (!columns.some((column) => column.name === "condition_id"))
+        this.db.exec(
+          "ALTER TABLE markets ADD COLUMN condition_id TEXT NOT NULL DEFAULT ''",
+        );
+      if (!columns.some((column) => column.name === "fees_enabled"))
+        this.db.exec(
+          "ALTER TABLE markets ADD COLUMN fees_enabled INTEGER NOT NULL DEFAULT 1",
+        );
+      const version = (
+        this.db.prepare("PRAGMA user_version").get() as {
+          user_version: number;
+        }
+      ).user_version;
+      if (version < 2) this.migrateEconomicFingerprints();
+      this.db.exec(`
+        CREATE TRIGGER IF NOT EXISTS fills_immutable_update BEFORE UPDATE ON fills BEGIN SELECT RAISE(ABORT, 'fills are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS fills_immutable_delete BEFORE DELETE ON fills BEGIN SELECT RAISE(ABORT, 'fills are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS legs_immutable_update BEFORE UPDATE ON legs BEGIN SELECT RAISE(ABORT, 'legs are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS legs_immutable_delete BEFORE DELETE ON legs BEGIN SELECT RAISE(ABORT, 'legs are immutable'); END;
+        PRAGMA user_version=2;
+        COMMIT;
+      `);
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+  private migrateEconomicFingerprints(): void {
+    this.db.exec(`
+      DROP TRIGGER IF EXISTS fills_immutable_update;
+      DROP TRIGGER IF EXISTS fills_immutable_delete;
+      DROP TRIGGER IF EXISTS legs_immutable_update;
+      DROP TRIGGER IF EXISTS legs_immutable_delete;
+    `);
+    const positions = this.db
+      .prepare("SELECT id FROM positions ORDER BY opened_at,id")
+      .all() as { id: number }[];
+    const fingerprintById = new Map<number, string>();
+    const retainedByFingerprint = new Map<string, number>();
+    const collisions: number[] = [];
+    const legQuery = this.db.prepare(
+      "SELECT token_id,outcome FROM legs WHERE position_id=? ORDER BY id",
+    );
+    for (const position of positions) {
+      const legs = legQuery.all(position.id) as {
+        token_id: unknown;
+        outcome: unknown;
+      }[];
+      if (legs.length === 0)
+        throw new Error(
+          `Cannot migrate position ${position.id}: no economic legs`,
+        );
+      const fingerprint = canonicalPositionFingerprint(
+        legs.map((leg) => ({
+          tokenId: text(leg.token_id, "legs.token_id"),
+          outcome: text(leg.outcome, "legs.outcome") as BasketLeg["outcome"],
+        })),
       );
+      fingerprintById.set(position.id, fingerprint);
+      if (retainedByFingerprint.has(fingerprint)) collisions.push(position.id);
+      else retainedByFingerprint.set(fingerprint, position.id);
+    }
+    const deleteChildren = (table: "fills" | "legs", id: number) =>
+      this.db.prepare(`DELETE FROM ${table} WHERE position_id=?`).run(id);
+    for (const id of collisions) {
+      deleteChildren("fills", id);
+      deleteChildren("legs", id);
+      this.db.prepare("DELETE FROM positions WHERE id=?").run(id);
+      fingerprintById.delete(id);
+    }
+    let prefix = "__polygraph_fingerprint_migration__";
+    while (
+      this.db
+        .prepare("SELECT 1 FROM positions WHERE fingerprint LIKE ? LIMIT 1")
+        .get(`${prefix}%`)
+    )
+      prefix += "_";
+    for (const id of fingerprintById.keys())
+      this.db
+        .prepare("UPDATE positions SET fingerprint=? WHERE id=?")
+        .run(`${prefix}${id}`, id);
+    for (const [id, fingerprint] of fingerprintById)
+      this.db
+        .prepare("UPDATE positions SET fingerprint=? WHERE id=?")
+        .run(fingerprint, id);
   }
   close(): void {
     this.db.close();
   }
   upsertMarkets(markets: Market[]): void {
     const stmt = this.db.prepare(
-      `INSERT INTO markets(id,event_id,question,description,rules,resolution_source,yes_token_id,no_token_id,end_date,liquidity,volume,active,fetched_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET event_id=excluded.event_id,question=excluded.question,description=excluded.description,rules=excluded.rules,resolution_source=excluded.resolution_source,yes_token_id=excluded.yes_token_id,no_token_id=excluded.no_token_id,end_date=excluded.end_date,liquidity=excluded.liquidity,volume=excluded.volume,active=excluded.active,fetched_at=excluded.fetched_at`,
+      `INSERT INTO markets(id,event_id,condition_id,fees_enabled,question,description,rules,resolution_source,yes_token_id,no_token_id,end_date,liquidity,volume,active,fetched_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET event_id=excluded.event_id,condition_id=excluded.condition_id,fees_enabled=excluded.fees_enabled,question=excluded.question,description=excluded.description,rules=excluded.rules,resolution_source=excluded.resolution_source,yes_token_id=excluded.yes_token_id,no_token_id=excluded.no_token_id,end_date=excluded.end_date,liquidity=excluded.liquidity,volume=excluded.volume,active=excluded.active,fetched_at=excluded.fetched_at`,
     );
     this.db.exec("BEGIN");
     try {
@@ -93,6 +171,8 @@ export class Store {
         stmt.run(
           m.id,
           m.eventId,
+          m.conditionId,
+          m.feesEnabled ? 1 : 0,
           m.question,
           m.description,
           m.rules,
@@ -114,7 +194,7 @@ export class Store {
   /** Replace the configured top-N Gamma snapshot; rows outside it are inactive. */
   replaceMarketSnapshot(markets: Market[]): void {
     const stmt = this.db.prepare(
-      `INSERT INTO markets(id,event_id,question,description,rules,resolution_source,yes_token_id,no_token_id,end_date,liquidity,volume,active,fetched_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET event_id=excluded.event_id,question=excluded.question,description=excluded.description,rules=excluded.rules,resolution_source=excluded.resolution_source,yes_token_id=excluded.yes_token_id,no_token_id=excluded.no_token_id,end_date=excluded.end_date,liquidity=excluded.liquidity,volume=excluded.volume,active=excluded.active,fetched_at=excluded.fetched_at`,
+      `INSERT INTO markets(id,event_id,condition_id,fees_enabled,question,description,rules,resolution_source,yes_token_id,no_token_id,end_date,liquidity,volume,active,fetched_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET event_id=excluded.event_id,condition_id=excluded.condition_id,fees_enabled=excluded.fees_enabled,question=excluded.question,description=excluded.description,rules=excluded.rules,resolution_source=excluded.resolution_source,yes_token_id=excluded.yes_token_id,no_token_id=excluded.no_token_id,end_date=excluded.end_date,liquidity=excluded.liquidity,volume=excluded.volume,active=excluded.active,fetched_at=excluded.fetched_at`,
     );
     this.db.exec("BEGIN");
     try {
@@ -123,6 +203,8 @@ export class Store {
         stmt.run(
           m.id,
           m.eventId,
+          m.conditionId,
+          m.feesEnabled ? 1 : 0,
           m.question,
           m.description,
           m.rules,
@@ -149,6 +231,8 @@ export class Store {
     ).map((r) => ({
       id: String(r.id),
       eventId: nullableText(r.event_id, "markets.event_id"),
+      conditionId: text(r.condition_id, "markets.condition_id"),
+      feesEnabled: Boolean(r.fees_enabled),
       question: String(r.question),
       description: String(r.description),
       rules: String(r.rules),
@@ -203,7 +287,7 @@ export class Store {
     basketKey: string,
     fill: FillEstimate,
   ): number | null {
-    const fingerprint = canonicalPositionFingerprint(c, fill);
+    const fingerprint = canonicalPositionFingerprint(fill.legs);
     const now = new Date().toISOString();
     this.db.exec("BEGIN");
     try {
@@ -260,16 +344,25 @@ export class Store {
       )
       .all() as unknown as PositionRow[];
   }
-  positionLegs(id: number): { tokenId: string; quantity: string }[] {
+  positionLegs(id: number): {
+    marketId: string;
+    tokenId: string;
+    quantity: string;
+    conditionId: string;
+    feesEnabled: boolean;
+  }[] {
     return (
       this.db
         .prepare(
-          "SELECT token_id,quantity FROM legs WHERE position_id=? ORDER BY id",
+          "SELECT l.market_id,l.token_id,l.quantity,m.condition_id,m.fees_enabled FROM legs l LEFT JOIN markets m ON m.id=l.market_id WHERE l.position_id=? ORDER BY l.id",
         )
         .all(id) as Record<string, unknown>[]
     ).map((r) => ({
+      marketId: String(r.market_id),
       tokenId: String(r.token_id),
       quantity: String(r.quantity),
+      conditionId: text(r.condition_id, "markets.condition_id"),
+      feesEnabled: Boolean(r.fees_enabled),
     }));
   }
   spent(): string {
