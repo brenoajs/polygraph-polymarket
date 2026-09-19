@@ -4,7 +4,7 @@ import type { CandidatePair, Classification, Relation } from "./types.js";
 import { RELATIONS } from "./types.js";
 
 const MODEL = "typesafe-ai/jev";
-interface EvalOutput {
+export interface EvalOutput {
   relation: Relation;
   ambiguousProbability: number;
   confidence: number;
@@ -12,6 +12,46 @@ interface EvalOutput {
 export type EvaluatePair = (
   state: Record<string, JSONValue>,
 ) => Promise<EvalOutput>;
+
+function record(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+function probability(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    value >= 0 &&
+    value <= 1
+  );
+}
+
+/** Map the AI SDK response without conflating Choice probability with confidence. */
+export function mapEvaluationResponse(input: unknown): EvalOutput {
+  const root = record(input);
+  const answers = record(root?.answers);
+  const relationAnswer = record(answers?.relation);
+  const ambiguousAnswer = record(answers?.ambiguous);
+  const relation = relationAnswer?.choice;
+  const metadata = record(root?.providerMetadata);
+  const typesafe = record(metadata?.typesafe);
+  const confidenceByQuestion = record(typesafe?.confidence);
+  const confidence = confidenceByQuestion?.relation;
+  const ambiguousProbability = ambiguousAnswer?.probability;
+  if (
+    typeof relation !== "string" ||
+    !RELATIONS.includes(relation as Relation) ||
+    !probability(confidence) ||
+    !probability(ambiguousProbability)
+  )
+    throw new Error("Invalid Jev evaluation response");
+  return {
+    relation: relation as Relation,
+    ambiguousProbability,
+    confidence,
+  };
+}
 
 async function liveEvaluate(
   state: Record<string, JSONValue>,
@@ -27,7 +67,7 @@ async function liveEvaluate(
       relation: {
         type: "choice",
         instructions:
-          "Classify the logical relation between binary prediction market proposition A and proposition B using their exact wording, rules, and resolution dates. Do not infer a trade or calculate prices.",
+          "Classify the logical relation between binary prediction market proposition A and proposition B using their complete descriptions, rules, resolution sources, and dates. Do not infer a trade or calculate prices.",
         criteria: {
           equivalent:
             "A and B necessarily have the same truth value under their resolution rules.",
@@ -49,26 +89,7 @@ async function liveEvaluate(
       },
     },
   });
-  const relation = result.answers.relation.choice;
-  const selectedProbability = result.answers.relation.probabilities?.[relation];
-  const metadata = result.providerMetadata?.typesafe as
-    | Record<string, unknown>
-    | undefined;
-  const confidenceMap = metadata?.confidence as
-    | Record<string, unknown>
-    | undefined;
-  const providerConfidence = confidenceMap?.relation;
-  const confidence =
-    typeof selectedProbability === "number"
-      ? selectedProbability
-      : typeof providerConfidence === "number"
-        ? providerConfidence
-        : 0;
-  return {
-    relation,
-    ambiguousProbability: result.answers.ambiguous.probability,
-    confidence,
-  };
+  return mapEvaluationResponse(result);
 }
 
 export class JevClassifier {
@@ -77,19 +98,23 @@ export class JevClassifier {
     const output = await this.evaluatePair({
       propositionA: {
         question: pair.a.question,
-        rules: pair.a.rules || pair.a.description,
+        description: pair.a.description,
+        rules: pair.a.rules,
+        resolutionSource: pair.a.resolutionSource,
         endDate: pair.a.endDate,
       },
       propositionB: {
         question: pair.b.question,
-        rules: pair.b.rules || pair.b.description,
+        description: pair.b.description,
+        rules: pair.b.rules,
+        resolutionSource: pair.b.resolutionSource,
         endDate: pair.b.endDate,
       },
     });
     if (
       !RELATIONS.includes(output.relation) ||
-      output.confidence < 0 ||
-      output.confidence > 1
+      !probability(output.confidence) ||
+      !probability(output.ambiguousProbability)
     )
       throw new Error("Jev returned an invalid classification");
     const ambiguous = output.ambiguousProbability >= 0.5;

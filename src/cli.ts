@@ -14,7 +14,7 @@ import {
   syncMarkets,
 } from "./service.js";
 import { ClobClient } from "./clob.js";
-import { bidValue } from "./depth.js";
+import { bidMark } from "./depth.js";
 import { GammaClient } from "./gamma.js";
 
 const program = new Command()
@@ -50,6 +50,7 @@ program
           if (!book) throw new Error(`missing fixture book ${id}`);
           return Promise.resolve(book);
         },
+        () => Promise.resolve("0"),
         config,
         config.startingCash,
       );
@@ -157,17 +158,35 @@ program
       const positions = [];
       for (const p of store.listPositions()) {
         let mark = new Decimal(0);
-        let complete = true;
+        let markStatus: "current" | "stale" | "unavailable" = "current";
         for (const leg of store.positionLegs(p.id)) {
-          const value = bidValue(await clob.getBook(leg.tokenId), leg.quantity);
-          if (value === null) {
-            complete = false;
+          try {
+            const book = await clob.getBook(leg.tokenId);
+            const timestamp = Date.parse(book.timestamp);
+            if (
+              !Number.isFinite(timestamp) ||
+              timestamp > Date.now() ||
+              Date.now() - timestamp > config.maxBookAgeSeconds * 1000
+            ) {
+              markStatus = "stale";
+              break;
+            }
+            const feeRate = await clob.getFeeRate(leg.tokenId);
+            const legMark = bidMark(book, leg.quantity, feeRate);
+            if (legMark === null) {
+              markStatus = "unavailable";
+              break;
+            }
+            mark = mark.plus(legMark.netValue);
+          } catch {
+            markStatus = "unavailable";
             break;
           }
-          mark = mark.plus(value);
         }
+        const complete = markStatus === "current";
         positions.push({
           ...p,
+          markStatus,
           executableBidMark: complete ? mark.toFixed() : null,
           unrealizedPnl: complete
             ? mark.minus(p.gross_cost).minus(p.fee).toFixed()
@@ -179,7 +198,7 @@ program
         spent: store.spent(),
         cash: new Decimal(config.startingCash).minus(store.spent()).toFixed(),
         openPositions: positions,
-        note: "Marks use displayed executable bids; settlement is never invented.",
+        note: "Marks use fresh displayed executable bids net of live platform fees; settlement is never invented.",
       });
     } finally {
       store.close();
@@ -197,11 +216,10 @@ program
       ).getActiveBinaryMarkets(1);
       let clob = "not tested (Gamma returned no binary market)";
       if (markets[0]) {
-        const book = await new ClobClient(
-          config.clobUrl,
-          config.httpTimeoutMs,
-        ).getBook(markets[0].yesTokenId);
-        clob = `ok (${book.asks.length} asks, ${book.bids.length} bids)`;
+        const client = new ClobClient(config.clobUrl, config.httpTimeoutMs);
+        const book = await client.getBook(markets[0].yesTokenId);
+        const feeRate = await client.getFeeRate(markets[0].yesTokenId);
+        clob = `ok (${book.asks.length} asks, ${book.bids.length} bids, base fee ${feeRate} bps)`;
       }
       output({
         node: process.version,

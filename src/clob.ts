@@ -10,7 +10,8 @@ function levels(value: unknown, side: "asks" | "bids"): Level[] {
       const price = stringValue(row.price);
       const size = stringValue(row.size);
       try {
-        if (new Decimal(price).gt(0) && new Decimal(size).gt(0))
+        const priceD = new Decimal(price);
+        if (priceD.gt(0) && priceD.lt(1) && new Decimal(size).gt(0))
           return [{ price, size }];
       } catch {
         /* omit malformed level */
@@ -24,17 +25,61 @@ function levels(value: unknown, side: "asks" | "bids"): Level[] {
     );
 }
 
-export function parseOrderBook(input: unknown, tokenId: string): OrderBook {
+function parseTimestamp(value: unknown, nowMs: number): string {
+  if (typeof value !== "string" && typeof value !== "number")
+    throw new Error("Invalid CLOB timestamp: missing");
+  const raw = String(value).trim();
+  if (!raw) throw new Error("Invalid CLOB timestamp: empty");
+  let milliseconds: number;
+  if (/^\d+(?:\.\d+)?$/.test(raw)) {
+    const numeric = Number(raw);
+    milliseconds = numeric < 1e12 ? numeric * 1000 : numeric;
+  } else {
+    milliseconds = Date.parse(raw);
+  }
+  if (
+    !Number.isFinite(milliseconds) ||
+    milliseconds <= 0 ||
+    milliseconds > nowMs
+  )
+    throw new Error("Invalid CLOB timestamp: malformed or future value");
+  return new Date(milliseconds).toISOString();
+}
+
+function parseMinOrderSize(value: unknown): string {
+  const raw = stringValue(value);
+  try {
+    if (raw && new Decimal(raw).isFinite() && new Decimal(raw).gt(0))
+      return raw;
+  } catch {
+    // Fall through to the fail-closed error.
+  }
+  throw new Error("Invalid CLOB min_order_size");
+}
+
+export function parseFeeRate(input: unknown): string {
+  const raw = asRecord(input, "CLOB fee rate");
+  const value = raw.base_fee;
+  if (
+    typeof value !== "number" ||
+    !Number.isInteger(value) ||
+    value < 0 ||
+    value > 10_000
+  )
+    throw new Error("Invalid CLOB base_fee; expected integer basis points");
+  return String(value);
+}
+
+export function parseOrderBook(
+  input: unknown,
+  tokenId: string,
+  nowMs = Date.now(),
+): OrderBook {
   const raw = asRecord(input, "CLOB book");
-  const timestampRaw = stringValue(raw.timestamp);
-  const numeric = Number(timestampRaw);
-  const timestamp =
-    Number.isFinite(numeric) && numeric > 0
-      ? new Date(numeric < 1e12 ? numeric * 1000 : numeric).toISOString()
-      : timestampRaw || new Date().toISOString();
   return {
     tokenId: stringValue(raw.asset_id, tokenId),
-    timestamp,
+    timestamp: parseTimestamp(raw.timestamp, nowMs),
+    minOrderSize: parseMinOrderSize(raw.min_order_size),
     asks: levels(raw.asks, "asks"),
     bids: levels(raw.bids, "bids"),
   };
@@ -49,5 +94,10 @@ export class ClobClient {
     const url = new URL("/book", this.baseUrl);
     url.searchParams.set("token_id", tokenId);
     return parseOrderBook(await fetchJson(url, this.timeoutMs), tokenId);
+  }
+  async getFeeRate(tokenId: string): Promise<string> {
+    const url = new URL("/fee-rate", this.baseUrl);
+    url.searchParams.set("token_id", tokenId);
+    return parseFeeRate(await fetchJson(url, this.timeoutMs));
   }
 }

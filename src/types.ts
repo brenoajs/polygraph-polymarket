@@ -17,6 +17,7 @@ export interface Market {
   question: string;
   description: string;
   rules: string;
+  resolutionSource: string;
   yesTokenId: string;
   noTokenId: string;
   endDate: string | null;
@@ -53,6 +54,7 @@ export interface Level {
 export interface OrderBook {
   tokenId: string;
   timestamp: string;
+  minOrderSize: string;
   asks: Level[];
   bids: Level[];
 }

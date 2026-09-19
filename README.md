@@ -41,7 +41,7 @@ polygraph doctor                  # config/runtime and public API smoke check
 
 ## Safety model
 
-Jev (`experimental_evaluate`, model `typesafe-ai/jev`) only proposes one typed semantic relation and ambiguity metadata. Deterministic Decimal.js code maps relations to guaranteed-payoff baskets, consumes displayed asks at depth, accounts for configured fees, and gates stale books/classifications, confidence, ambiguity, slippage, depth, duplicate positions, cash, and net edge. `overlapping` and `unrelated` are never actionable.
+Jev (`experimental_evaluate`, model `typesafe-ai/jev`) only proposes one typed semantic relation and ambiguity metadata. Deterministic Decimal.js code maps relations to guaranteed-payoff baskets, consumes displayed asks at depth, retrieves each token's live CLOB fee rate, applies Polymarket's `shares × feeRate × price × (1-price)` formula at every consumed level, and gates stale books/classifications, confidence, ambiguity, minimum order size, slippage, depth, duplicate positions, cash, and net edge. `overlapping` and `unrelated` are never actionable.
 
 Relations map to baskets as follows:
 
@@ -51,11 +51,13 @@ Relations map to baskets as follows:
 - mutually exclusive: `A NO + B NO`
 - exhaustive: `A YES + B YES`
 
-Every basket has a minimum logical payoff of $1 per matched share under its relation. Quotes are estimates from displayed liquidity, not execution promises. Paper fills and legs are immutable via SQLite triggers. Open positions are marked only to displayed executable bids; PolyGraph does not invent settlement.
+Every basket has a minimum logical payoff of $1 per matched share under its relation. Quotes are estimates from displayed liquidity, not execution promises. Paper fills and legs are immutable via SQLite triggers. Open positions are marked only to fresh displayed executable bids; PolyGraph does not invent settlement.
 
 ## Configuration
 
-See [`.env.example`](.env.example). Defaults are deliberately bounded: $25 paper cap, 2% minimum net edge ratio, 85% relation confidence, 120-second book age, and 100 candidate maximum. Set fee and slippage limits for your assumptions. Optional Telegram notification requires both `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` and only announces accepted paper records.
+See [`.env.example`](.env.example). Defaults are deliberately bounded: $25 paper cap, 2% minimum net edge ratio, 85% relation confidence, 120-second book age, and 100 candidate maximum. Live platform fees are fetched fail-closed; `POLYGRAPH_EXTRA_CONSERVATIVE_FEE_BPS` can add a further safety buffer. Optional Telegram notification requires both `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` and only announces accepted paper records.
+
+The MVP intentionally accepts only markets whose two outcomes are literally `Yes` and `No`. Named two-outcome contracts are rejected rather than silently relabeled into a potentially different proposition.
 
 ## Development and deployment
 

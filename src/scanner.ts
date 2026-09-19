@@ -11,49 +11,91 @@ import { estimateFill } from "./depth.js";
 import type { Config } from "./config.js";
 
 export type BookProvider = (tokenId: string) => Promise<OrderBook>;
+export type FeeProvider = (tokenId: string) => Promise<string>;
+
+function timestampState(
+  value: string,
+  maxAgeSeconds: number,
+  now: number,
+): "valid" | "stale" | "invalid" {
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed) || parsed > now) return "invalid";
+  return now - parsed > maxAgeSeconds * 1000 ? "stale" : "valid";
+}
+function validFeeBps(value: string): boolean {
+  try {
+    const parsed = new Decimal(value);
+    return parsed.isInteger() && parsed.gte(0) && parsed.lte(10_000);
+  } catch {
+    return false;
+  }
+}
+
 export async function scanRelations(
   markets: Market[],
   classifications: Classification[],
   getBook: BookProvider,
+  getFeeRate: FeeProvider,
   config: Config,
   availableCash = config.tradeCap,
 ): Promise<ScanResult> {
-  const byId = new Map(markets.map((m) => [m.id, m]));
+  const byId = new Map(markets.map((market) => [market.id, market]));
   const accepted: ScanResult["accepted"] = [];
   const rejected: ScanResult["rejected"] = [];
-  const cache = new Map<string, Promise<OrderBook>>();
+  const bookCache = new Map<string, Promise<OrderBook>>();
+  const feeCache = new Map<string, Promise<string>>();
   const book = (id: string): Promise<OrderBook> => {
-    let pending = cache.get(id);
+    let pending = bookCache.get(id);
     if (!pending) {
       pending = getBook(id);
-      cache.set(id, pending);
+      bookCache.set(id, pending);
     }
     return pending;
   };
-  for (const c of classifications) {
-    const pair = `${c.marketAId}/${c.marketBId}`;
-    const a = byId.get(c.marketAId);
-    const b = byId.get(c.marketBId);
+  const fee = (id: string): Promise<string> => {
+    let pending = feeCache.get(id);
+    if (!pending) {
+      pending = getFeeRate(id);
+      feeCache.set(id, pending);
+    }
+    return pending;
+  };
+  const now = Date.now();
+  for (const classification of classifications) {
+    const pair = `${classification.marketAId}/${classification.marketBId}`;
+    const a = byId.get(classification.marketAId);
+    const b = byId.get(classification.marketBId);
     if (!a || !b) {
       rejected.push({ pair, reason: "market_missing" });
       continue;
     }
-    if (c.ambiguous) {
+    if (classification.ambiguous) {
       rejected.push({ pair, reason: "ambiguous" });
       continue;
     }
-    if (c.confidence < config.minConfidence) {
+    if (
+      !Number.isFinite(classification.confidence) ||
+      classification.confidence < 0 ||
+      classification.confidence > 1 ||
+      classification.confidence < config.minConfidence
+    ) {
       rejected.push({ pair, reason: "low_confidence" });
       continue;
     }
-    if (
-      Date.now() - Date.parse(c.classifiedAt) >
-      config.maxClassificationAgeSeconds * 1000
-    ) {
+    const classificationTime = timestampState(
+      classification.classifiedAt,
+      config.maxClassificationAgeSeconds,
+      now,
+    );
+    if (classificationTime === "invalid") {
+      rejected.push({ pair, reason: "invalid_classification_timestamp" });
+      continue;
+    }
+    if (classificationTime === "stale") {
       rejected.push({ pair, reason: "stale_classification" });
       continue;
     }
-    const baskets = basketsFor(c.relation, a, b);
+    const baskets = basketsFor(classification.relation, a, b);
     if (baskets.length === 0) {
       rejected.push({ pair, reason: "non_actionable_relation" });
       continue;
@@ -64,22 +106,46 @@ export async function scanRelations(
     } | null = null;
     let failure = "insufficient_depth";
     for (const basket of baskets) {
-      const books = await Promise.all([
-        book(basket.legs[0].tokenId),
-        book(basket.legs[1].tokenId),
-      ]);
-      if (
-        books.some(
-          (x) =>
-            Date.now() - Date.parse(x.timestamp) >
-            config.maxBookAgeSeconds * 1000,
-        )
-      ) {
+      let books: [OrderBook, OrderBook];
+      try {
+        books = await Promise.all([
+          book(basket.legs[0].tokenId),
+          book(basket.legs[1].tokenId),
+        ]);
+      } catch {
+        failure = "book_unavailable";
+        continue;
+      }
+      const states = books.map((item) =>
+        timestampState(item.timestamp, config.maxBookAgeSeconds, now),
+      );
+      if (states.includes("invalid")) {
+        failure = "invalid_book_timestamp";
+        continue;
+      }
+      if (states.includes("stale")) {
         failure = "stale_book";
         continue;
       }
+      let fees: [string, string];
+      try {
+        fees = await Promise.all([
+          fee(basket.legs[0].tokenId),
+          fee(basket.legs[1].tokenId),
+        ]);
+        if (!fees.every(validFeeBps)) throw new Error("invalid fee");
+      } catch {
+        failure = "fee_unavailable";
+        continue;
+      }
       const cap = Decimal.min(config.tradeCap, availableCash).toFixed();
-      const fill = estimateFill(basket, books, cap, config.feeBps);
+      const fill = estimateFill(
+        basket,
+        books,
+        cap,
+        fees,
+        config.extraConservativeFeeBps,
+      );
       if (!fill) continue;
       if (new Decimal(fill.slippageBps).gt(config.maxBookSlippageBps)) {
         failure = "excessive_slippage";
@@ -97,7 +163,7 @@ export async function scanRelations(
     }
     if (best)
       accepted.push({
-        classification: c,
+        classification,
         basket: best.basket,
         fill: best.fill,
       });

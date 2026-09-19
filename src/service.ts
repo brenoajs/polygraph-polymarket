@@ -17,7 +17,7 @@ export async function syncMarkets(
     config.gammaUrl,
     config.httpTimeoutMs,
   ).getActiveBinaryMarkets(config.syncLimit);
-  store.upsertMarkets(markets);
+  store.replaceMarketSnapshot(markets);
   return markets.length;
 }
 export async function classifyMarkets(
@@ -42,6 +42,7 @@ export async function scanStored(store: Store, config: Config) {
     store.listMarkets(),
     store.listClassifications(),
     (id) => clob.getBook(id),
+    (id) => clob.getFeeRate(id),
     config,
     cash,
   );
