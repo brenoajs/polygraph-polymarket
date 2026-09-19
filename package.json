@@ -1,0 +1,42 @@
+{
+  "name": "polygraph",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Read-only Polymarket semantic-relation scanner with paper-only execution",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "polygraph": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint .",
+    "format": "prettier --check .",
+    "format:write": "prettier --write .",
+    "start": "node dist/cli.js",
+    "demo": "tsx src/cli.ts demo"
+  },
+  "dependencies": {
+    "@ai-sdk/provider": "4.0.17",
+    "ai": "7.0.107",
+    "commander": "15.0.0",
+    "decimal.js": "10.6.0",
+    "dotenv": "17.2.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.2",
+    "@types/node": "22.19.15",
+    "eslint": "9.39.2",
+    "eslint-config-prettier": "10.1.8",
+    "prettier": "3.8.2",
+    "tsx": "4.21.0",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.57.1",
+    "vitest": "5.0.1"
+  }
+}
